@@ -1,1 +1,1 @@
-# Breast-Density-Fr-chet-Distance-BDFD-Metric-
+# Breast-Density-Frechet-Distance-BDFD-Metric
