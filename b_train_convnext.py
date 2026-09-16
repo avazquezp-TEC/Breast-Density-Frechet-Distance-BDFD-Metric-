@@ -16,7 +16,7 @@ import numpy as np
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
 
 
-logger = logging.getLogger(__name__)        # define el logger para mostrar información en pantalla
+
 
 def seed_everything(seed: int = 42) -> None:
     """
@@ -58,8 +58,11 @@ def build_model(num_classes: int) -> tuple[nn.Module, object]:
     # model = convnext_base(weights=weights)
     logger.debug(model)                                             # muestra la estructura del modelo
     in_features = model.classifier[2].in_features                   # obtiene el tamaño de la capa final
-    model.classifier[2] = nn.Linear(in_features, num_classes)       # reemplaza classifier[2] (head) por 
-    # la nueva capa y con entrada (in_features) y salida(num_clases)
+    # Reemplazar la capa final por Dropout + Linear
+    model.classifier[2] = nn.Sequential(                            # reemplaza classifier[2] (head) por la nueva capa
+        nn.Dropout(p=0.3),                                          # probabilidad de apagar neuronas
+        nn.Linear(in_features, num_classes)                         #  y con entrada (in_features) y salida(num_clases)
+    )
 
     return model, weights
 
@@ -264,4 +267,5 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s:%(name)s: %(message)s",
     )
+    logger = logging.getLogger(__name__)        # define el logger para mostrar información en pantalla
     main(max_epochs = 1)

@@ -6,6 +6,7 @@ from PIL import Image, ImageOps
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader, random_split, WeightedRandomSampler
 from torchvision import transforms
+import logging
 
 class ResizeWithPadding:
     """
@@ -62,6 +63,7 @@ class MammoDataset(Dataset):
         self.data = self.data[self.data['label'].notna()]
         
         self.data = self.data.reset_index(drop=True)                                                    # Reiniciar los índices del DataFrame, ya que si no quedan huecos
+        self.logger = logging.getLogger(__name__)
 
     def __len__(self): # devuelve la cantidad de datos
         return len(self.data)
@@ -87,7 +89,7 @@ class MammoDataset(Dataset):
             else:
                 cropped = image_np
         else:
-            print("mascara invalida. saltando...")
+            self.logger.debug("mascara invalida. saltando...")
             cropped = image_np
 
         cropped_img = Image.fromarray(cropped)                                  # 1. Convertir siempre a PIL para aplicarle las transformaciones de torchvision
@@ -137,6 +139,3 @@ if __name__ == "__main__":
     dataset = MammoDataset(csv_file=ruta_csv, transform=data_transforms)
     train_loader, val_loader = dataset.get_loader()
     #aqui va train y val.
-
-    
-

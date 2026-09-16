@@ -9,7 +9,7 @@ c_train_convnext.py.
 """
 
 from __future__ import annotations
-
+from tqdm import tqdm
 import argparse
 import logging
 import random
@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from c_dataset_manage import MammoSSLDataset
+from c_dataset_manage import MammoDataset
 
 logger = logging.getLogger(__name__)
 
@@ -45,32 +45,30 @@ def get_device() -> torch.device:
 
 class SimMIMMaskGenerator:
     """
-    Genera una máscara binaria a nivel de "parche" de tamaño
-    `mask_patch_size` sobre la imagen de entrada (224x224). Se usa
-    mask_patch_size = stride total del encoder (32 para ConvNeXt V2: stem
-    stride 4 * 3 downsamplings de stride 2), así cada parche enmascarado
-    corresponde a exactamente una posición del mapa de características
-    final (grid de 7x7 = 49 "tokens").
+    Genera una máscara binaria a nivel de "parche" vectorizada para todo el batch
+    directamente en el dispositivo (GPU), evitando cuellos de botella.
     """
-    def __init__(self, input_size: int = 224, mask_patch_size: int = 32, mask_ratio: float = 0.6):
+    def __init__(self, input_size: int = 512, mask_patch_size: int = 32, mask_ratio: float = 0.6):
         assert input_size % mask_patch_size == 0, "input_size debe ser múltiplo de mask_patch_size"
         self.input_size = input_size
         self.mask_patch_size = mask_patch_size
-        self.grid_size = input_size // mask_patch_size          # 7 para 224/32
-        self.num_patches = self.grid_size ** 2                  # 49
+        self.grid_size = input_size // mask_patch_size          
+        self.num_patches = self.grid_size ** 2                  
         self.mask_ratio = mask_ratio
         self.num_mask = int(round(self.num_patches * mask_ratio))
 
-    def __call__(self) -> torch.Tensor:
-        idx = torch.randperm(self.num_patches)[: self.num_mask]
-        mask = torch.zeros(self.num_patches, dtype=torch.float32)
-        mask[idx] = 1.0
-        mask = mask.reshape(self.grid_size, self.grid_size)
-        # Escala la máscara de la grilla de tokens al tamaño de la imagen,
-        # para poder aplicarla directamente sobre los píxeles de entrada.
-        mask = mask.repeat_interleave(self.mask_patch_size, dim=0)
+    def __call__(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        # Genera ruido aleatorio directamente en GPU para todo el batch
+        noise = torch.rand(batch_size, self.num_patches, device=device)
+        ids_shuffle = torch.argsort(noise, dim=1)
+        
+        mask = torch.zeros(batch_size, self.num_patches, device=device)
+        mask.scatter_(1, ids_shuffle[:, :self.num_mask], 1.0)
+        
+        mask = mask.view(batch_size, self.grid_size, self.grid_size)
         mask = mask.repeat_interleave(self.mask_patch_size, dim=1)
-        return mask  # (H, W) con 1.0 = oculto, 0.0 = visible
+        mask = mask.repeat_interleave(self.mask_patch_size, dim=2)
+        return mask  # (B, H, W) en GPU
 
 
 class ConvNeXtV2SimMIM(nn.Module):
@@ -124,23 +122,30 @@ def simmim_loss(recon: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -
     return loss
 
 
-def train_one_epoch(model, loader, mask_gen, optimizer, device) -> float:
+def train_one_epoch(model, loader, mask_gen, optimizer, scaler, device) -> float:
     model.train()
     running_loss = 0.0
     total = 0
-    for images in loader:
-        images = images.to(device)
+
+    for images in tqdm(loader, desc="Entrenando", unit="batch"):
+        images = images.to(device, non_blocking=True)
         b = images.size(0)
-        mask = torch.stack([mask_gen() for _ in range(b)]).to(device)
+        mask = mask_gen(b, device)
 
         optimizer.zero_grad()
-        recon, mask = model(images, mask)
-        loss = simmim_loss(recon, images, mask)
-        loss.backward()
-        optimizer.step()
+        
+        #with torch.amp.autocast('cuda', enabled=(device.type == "cuda")):
+        with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            recon, mask = model(images, mask)
+            loss = simmim_loss(recon, images, mask)
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         running_loss += loss.item() * b
         total += b
+
     return running_loss / total
 
 
@@ -150,11 +155,17 @@ def validate(model, loader, mask_gen, device) -> float:
     running_loss = 0.0
     total = 0
     for images in loader:
-        images = images.to(device)
+        images = images.to(device, non_blocking=True)
         b = images.size(0)
-        mask = torch.stack([mask_gen() for _ in range(b)]).to(device)
-        recon, mask = model(images, mask)
-        loss = simmim_loss(recon, images, mask)
+        
+        # NUEVA FORMA: Llamada vectorizada a mask_gen
+        mask = mask_gen(b, device)
+        
+        # Mantenemos autocast en validación para no quedarnos sin memoria
+        with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            recon, mask = model(images, mask)
+            loss = simmim_loss(recon, images, mask)
+            
         running_loss += loss.item() * b
         total += b
     return running_loss / total
@@ -163,9 +174,9 @@ def validate(model, loader, mask_gen, device) -> float:
 def main(
     seed: int = 42,
     max_epochs: int = 200,
-    patience: int = 10,
-    batch_size: int = 64,
-    lr: float = 1.5e-4,
+    patience: int = 15,
+    batch_size: int = 16,
+    lr: float = 1e-4,
     mask_ratio: float = 0.6,
     csv_path: str = "../../Experimentos/Mammo_Bench_v2/mammo-bench.csv",
     out_path: str = "convnextv2_tiny_mae_encoder.pth",
@@ -175,7 +186,8 @@ def main(
     logger.info(f"Using device: {device}")
     logger.info(f"Seed: {seed}")
 
-    dataset = MammoSSLDataset(csv_file=Path(csv_path))
+    # dataset = MammoSSLDataset(csv_file=Path(csv_path))
+    dataset = MammoDataset(csv_file = Path(csv_path), ssl_mode=True, crop=False)
     logger.info(f"Imágenes disponibles para SSL: {len(dataset)}")
     if len(dataset) == 0:
         raise RuntimeError(
@@ -183,22 +195,25 @@ def main(
             "vista MLO, vista vacía o sin etiqueta de densidad."
         )
 
-    train_loader, val_loader = dataset.get_ssl_loader(seed=seed, batch_size=batch_size)
+    train_loader, val_loader = dataset.get_loader(seed=seed, batch_size=batch_size)
 
     # Se parte del checkpoint de ConvNeXt V2 preentrenado con FCMAE en
     # ImageNet 
     model = ConvNeXtV2SimMIM(encoder_name="convnextv2_tiny.fcmae", pretrained=True).to(device)
-    mask_gen = SimMIMMaskGenerator(input_size=224, mask_patch_size=model.encoder_stride, mask_ratio=mask_ratio)
+    mask_gen = SimMIMMaskGenerator(input_size=512, mask_patch_size=model.encoder_stride, mask_ratio=mask_ratio)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs)
-
+    
+    # 1. Inicializar el GradScaler para mixed precision
+    #scaler = torch.amp.GradScaler('cuda', enabled=(device.type == "cuda"))
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     best_val = float("inf")
     best_state = None
     counter = 0
-
     for epoch in range(1, max_epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, mask_gen, optimizer, device)
+        # 2. Agregar scaler a la llamada
+        train_loss = train_one_epoch(model, train_loader, mask_gen, optimizer, scaler, device)
         val_loss = validate(model, val_loader, mask_gen, device)
         scheduler.step()
 
@@ -228,17 +243,18 @@ def main(
 
 if __name__ == "__main__":
     logging.basicConfig(
-        level=logging.INFO,
+        filename="ejecucionSSL.log",
+        level=logging.DEBUG,
         format="%(asctime)s - %(levelname)s:%(name)s: %(message)s",
     )
 
     parser = argparse.ArgumentParser(description="Preentrenamiento SSL (SimMIM) de ConvNeXt V2 sobre MammoBench.")
-    parser.add_argument("--csv", type=str, default="../../Experimentos/Mammo_Bench_v2/mammo-bench.csv")
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--patience", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--lr", type=float, default=1.5e-4)
-    parser.add_argument("--mask-ratio", type=float, default=0.6)
+    parser.add_argument("--csv", type=str, default="../Experimentos/Mammo_Bench_v2/mammo-bench.csv")
+    parser.add_argument("--epochs", type=int, default=200) #200
+    parser.add_argument("--patience", type=int, default=14)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--mask-ratio", type=float, default=0.7)
     parser.add_argument("--out", type=str, default="convnextv2_tiny_mae_encoder.pth")
     args = parser.parse_args()
 

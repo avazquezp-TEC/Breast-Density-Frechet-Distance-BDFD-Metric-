@@ -4,13 +4,13 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-
+from tqdm import tqdm
 import timm
 from PIL import Image
 from torch.utils.data import DataLoader, random_split
 import logging
 import pandas as pd
-from b_dataset_manage import MammoDataset, data_transforms
+from c_dataset_manage import MammoDataset, data_transforms
 import numpy as np
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
 
@@ -169,7 +169,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device) -> float:
     model.train()
     running_loss = 0.0
     total = 0
-    for images, labels in loader:
+    for images, labels in tqdm(loader, desc="Training", unit="batch"):
         images = images.to(device)
         labels = labels.to(device)
 
@@ -192,7 +192,7 @@ def validate(model, loader, criterion, device, num_classes: int = 4):
     total = 0
     all_preds, all_labels = [], []
 
-    for images, labels in loader:   # torch.no_grad() evita calcular gradientes y optimiza memoria/tiempo
+    for images, labels in tqdm(loader, desc="Validating", unit="batch"):   # torch.no_grad() evita calcular gradientes y optimiza memoria/tiempo
         images = images.to(device)
         labels = labels.to(device)
 
@@ -214,9 +214,9 @@ def validate(model, loader, criterion, device, num_classes: int = 4):
 
 def main(
     seed: int = 42,
-    max_epochs: int = 50,
-    patience: int = 7,
-    batch_size: int = 32,
+    max_epochs: int = 100,
+    patience: int = 10,
+    batch_size: int = 16,
     ssl_checkpoint: str | Path | None = "convnextv2_tiny_mae_encoder.pth",
 ):
 
@@ -228,7 +228,7 @@ def main(
     logger.info(f"Using device: {device}")
     logger.info(f"Seed: {seed}")
 
-    optimizer = get_optimizer(model, backbone_lr=1e-5, head_lr=1e-3)        # asign differents lr to the model
+    optimizer = get_optimizer(model, backbone_lr=1e-5, head_lr=1e-4)        # asign differents lr to the model
     criterion = nn.CrossEntropyLoss()                                       # asigna criterio para loss function
 
     # Ajusta automáticamente el learning rate (el "step size") cuando la
@@ -236,12 +236,12 @@ def main(
         optimizer, mode="min", factor=0.5, patience=3                       # tras 3 épocas sin mejora.
     )
 
-    ruta_csv = Path("../../Experimentos/Mammo_Bench_v2/mammo-bench.csv")
+    ruta_csv = Path("../Experimentos/Mammo_Bench_v2/mammo-bench.csv")
     dataset = MammoDataset(csv_file = ruta_csv)                             # crea el objeto MammoDataset que creara los loaders de entrenamiento y validacion
 
     train_loader, val_loader = dataset.get_loader(seed=seed, batch_size=batch_size) # invoca al mammodataset para crear los loaders de entrenamiento y validación
 
-    early_stopping = EarlyStopping(patience=patience)                       # configura early stoping con patience de 7. pero a que factor?
+    early_stopping = EarlyStopping(patience = patience, min_delta = 1e-4)                       # configura early stoping con patience de 7. pero a que factor?
 
     for epoch in range(1, max_epochs + 1):                                  # hace entrenamiento y validacion en cada epoca
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
@@ -279,10 +279,10 @@ def main(
 
     logger.info(
         f"Validation Stage (mejor modelo) -> Loss: {final_loss:.4f} | "
-        f"Accuracy: {final_metrics['accuracy']:.2f}% | "
-        f"Precision(macro): {final_metrics['precision']:.2f}% | "
-        f"Recall(macro): {final_metrics['recall']:.2f}% | "
-        f"F1(macro): {final_metrics['f1']:.2f}%"
+        f"Accuracy: {final_metrics['accuracy']:.4f}% | "
+        f"Precision(macro): {final_metrics['precision']:.4f}% | "
+        f"Recall(macro): {final_metrics['recall']:.4f}% | "
+        f"F1(macro): {final_metrics['f1']:.4f}%"
     )
     logger.info(
         "Matriz de confusión (filas=real, columnas=predicho, orden A,B,C,D):\n"
@@ -292,8 +292,9 @@ def main(
 
 if __name__ == "__main__":
     logging.basicConfig(
+        filename="finetunning.log",
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s:%(name)s: %(message)s",
     )
     logger = logging.getLogger(__name__)        # define el logger para mostrar información en pantalla
-    main(max_epochs = 1)
+    main(max_epochs = 100)
